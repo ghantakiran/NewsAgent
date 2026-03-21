@@ -395,6 +395,16 @@ COMPANY_TO_TICKER = {
 def extract_ticker_from_name(text: str) -> str | None:
     """Try to find a stock ticker by matching company names in the text."""
     text_lower = text.lower()
+    # Strip financial "target" phrases to avoid "target" → TGT false positives.
+    # Preserves standalone "Target" (the company), e.g. "Target reports earnings".
+    text_lower = re.sub(
+        r'\bprice\s+target\b'
+        r'|\btarget\s+price\b'
+        r'|\btarget\s*(?:raised|lowered|cut|bumped|set|hiked|increased|decreased)\b'
+        r'|\b(?:raises?|lowers?|cuts?|sets?|hikes?|increases?|decreases?)\s+(?:(?:stock|price)\s+)*target\b'
+        r'|\btarget\s+(?:to|of|at|:)\s*\$',
+        '', text_lower
+    )
     # Try multi-word names first (longer matches are more specific)
     for name, ticker in sorted(COMPANY_TO_TICKER.items(), key=lambda x: -len(x[0])):
         # Use word boundary matching to avoid partial matches (e.g., "arm" in "warming")
