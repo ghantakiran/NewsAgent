@@ -1,0 +1,109 @@
+# Default RSS feeds — edit or add your own
+
+[[feeds]]
+name = "Yahoo Finance"
+url = "https://finance.yahoo.com/news/rssindex"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "MarketWatch Top Stories"
+url = "http://feeds.marketwatch.com/marketwatch/topstories/"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "CNBC Top News"
+url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "Investing.com News"
+url = "https://www.investing.com/rss/news.rss"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "Google News Analyst Ratings"
+url = "https://news.google.com/rss/search?q=analyst+rating+price+target+upgrade+downgrade&hl=en-US&gl=US&ceid=US:en"
+category = "upgrades_downgrades"
+enabled = true
+
+[[feeds]]
+name = "Google News Stock Upgrades"
+url = "https://news.google.com/rss/search?q=stock+upgrade+downgrade+analyst&hl=en-US&gl=US&ceid=US:en"
+category = "upgrades_downgrades"
+enabled = true
+
+[[feeds]]
+name = "Benzinga News"
+url = "https://www.benzinga.com/feed"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "Nasdaq News"
+url = "https://www.nasdaq.com/feed/rssoutbound?category=Markets"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "SEC EDGAR 8-K Filings"
+url = "https://efts.sec.gov/LATEST/search-index?q=%228-K%22&dateRange=custom&startdt=2024-01-01&enddt=2025-12-31&forms=8-K"
+category = "filings"
+enabled = false
+
+[[feeds]]
+name = "FDA Press Releases"
+url = "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml"
+category = "fda"
+enabled = true
+
+[[feeds]]
+name = "CNBC Earnings"
+url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839135"
+category = "earnings"
+enabled = true
+
+[[feeds]]
+name = "Seeking Alpha Wall St Lunch"
+url = "https://seekingalpha.com/tag/wall-st-breakfast.xml"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "Seeking Alpha Market News"
+url = "https://seekingalpha.com/market_currents.xml"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "Google News Earnings"
+url = "https://news.google.com/rss/search?q=earnings+EPS+revenue+beats+misses+quarterly+results&hl=en-US&gl=US&ceid=US:en"
+category = "earnings"
+enabled = true
+
+[[feeds]]
+name = "Google News Analyst PT"
+url = "https://news.google.com/rss/search?q=%22price+target%22+%22raises%22+OR+%22lowers%22+OR+%22initiates%22+stock&hl=en-US&gl=US&ceid=US:en"
+category = "upgrades_downgrades"
+enabled = true
+
+[[feeds]]
+name = "Nasdaq Earnings"
+url = "https://www.nasdaq.com/feed/rssoutbound?category=Earnings"
+category = "earnings"
+enabled = true
+
+[[feeds]]
+name = "X/Twitter Stock Calls"
+url = "https://news.google.com/rss/search?q=%22stock+pick%22+OR+%22price+target%22+OR+%22buy+rating%22+twitter+OR+%22X+post%22&hl=en-US&gl=US&ceid=US:en"
+category = "upgrades_downgrades"
+enabled = true
+
+[[feeds]]
+name = "FinTwit Research"
+url = "https://news.google.com/rss/search?q=%22TENET+research%22+OR+%22HedgeMind%22+OR+%22unusual+whales%22+OR+%22wallstreetbets%22+stock&hl=en-US&gl=US&ceid=US:en"
+category = "general"
+enabled = true

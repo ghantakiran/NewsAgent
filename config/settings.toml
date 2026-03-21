@@ -1,0 +1,10 @@
+[general]
+refresh_interval = 20       # seconds between feed refreshes
+max_articles = 500          # max articles to keep in database
+prune_after_days = 2        # auto-delete articles older than 48 hours
+
+[ui]
+theme = "dark"
+articles_per_page = 50
+show_source_badges = true
+show_timestamps = true

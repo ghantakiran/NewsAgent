@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+data/*.db
+*.sqlite
+*.sqlite3
+.venv/
+venv/
+
+# Dev artifacts
+.playwright-mcp/
+*.png
+!/docs/*.png
