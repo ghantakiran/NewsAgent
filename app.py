@@ -1204,7 +1204,7 @@ def load_all_feeds() -> list[Feed]:
 def load_settings() -> dict:
     path = ROOT / "config" / "settings.toml"
     if not path.exists():
-        return {"general": {"refresh_interval": 30, "max_articles": 500, "prune_after_days": 7}}
+        return {"general": {"refresh_interval": 15, "max_articles": 500, "prune_after_days": 7}}
     return toml.load(str(path))
 
 
@@ -1269,7 +1269,7 @@ def fetch_all_feeds(feeds: list[Feed]) -> int:
 
 
 class FeedRefresher:
-    def __init__(self, feeds: list[Feed], interval: int = 30):
+    def __init__(self, feeds: list[Feed], interval: int = 15):
         self.feeds = feeds
         self.interval = interval
         self._running = False
@@ -2052,6 +2052,163 @@ DARK_CSS = """
         font-weight: 500;
     }
 
+    /* ── Mobile Responsive ── */
+    @media (max-width: 768px) {
+        /* Force Streamlit columns to stack vertically */
+        div[data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+        }
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+        }
+
+        /* Logo */
+        .newsagent-logo {
+            font-size: 1.15rem !important;
+        }
+
+        /* Tabs — horizontal scroll instead of wrap */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 2px !important;
+            overflow-x: auto !important;
+            flex-wrap: nowrap !important;
+            -webkit-overflow-scrolling: touch;
+            padding-bottom: 4px !important;
+        }
+        .stTabs [data-baseweb="tab"] {
+            font-size: 0.68rem !important;
+            padding: 6px 10px !important;
+            white-space: nowrap !important;
+        }
+
+        /* Article cards — more compact */
+        .article-card {
+            padding: 8px 10px !important;
+            gap: 6px !important;
+        }
+        .article-time {
+            font-size: 0.65rem !important;
+            min-width: 38px !important;
+        }
+        .article-title {
+            font-size: 0.80rem !important;
+        }
+        .article-src {
+            font-size: 0.58rem !important;
+        }
+
+        /* Ticker & category badges — smaller */
+        .ticker-badge {
+            font-size: 0.60rem !important;
+            padding: 1px 5px !important;
+        }
+        .cat-tag {
+            font-size: 0.56rem !important;
+            padding: 1px 5px !important;
+        }
+
+        /* U/D rows — single column layout */
+        .ud-row {
+            grid-template-columns: 1fr !important;
+            gap: 4px !important;
+            padding: 8px 10px !important;
+        }
+        .ud-detail {
+            gap: 6px !important;
+        }
+
+        /* Column headers */
+        .col-header {
+            font-size: 0.70rem !important;
+            padding: 6px 10px !important;
+        }
+
+        /* Stat boxes — compact */
+        .stat-box {
+            padding: 8px 10px !important;
+        }
+        .stat-box .stat-num {
+            font-size: 1.3rem !important;
+        }
+        .stat-box .stat-label {
+            font-size: 0.58rem !important;
+        }
+
+        /* Refresh bar — stack */
+        .refresh-bar {
+            flex-direction: column !important;
+            gap: 3px !important;
+            font-size: 0.66rem !important;
+            padding: 6px 10px !important;
+        }
+
+        /* Breaking news — compact */
+        .breaking-header {
+            font-size: 0.70rem !important;
+            padding: 8px 10px !important;
+        }
+        .breaking-item {
+            padding: 6px 8px !important;
+            font-size: 0.78rem !important;
+        }
+        .breaking-item-title {
+            font-size: 0.78rem !important;
+        }
+        .breaking-scroll {
+            max-height: 50vh !important;
+        }
+
+        /* Earnings cards */
+        .earnings-card {
+            padding: 8px 10px !important;
+        }
+        .earnings-metrics {
+            gap: 6px !important;
+        }
+        .earnings-metric {
+            font-size: 0.72rem !important;
+        }
+
+        /* Watchlist chips */
+        .watchlist-chip {
+            font-size: 0.66rem !important;
+            padding: 2px 7px !important;
+        }
+
+        /* Touch-friendly buttons */
+        .stButton > button {
+            min-height: 44px !important;
+            padding: 8px 16px !important;
+            font-size: 0.80rem !important;
+        }
+
+        /* Inputs — larger touch targets */
+        .stTextInput input, .stSelectbox select {
+            min-height: 44px !important;
+            font-size: 0.85rem !important;
+        }
+
+        /* Scrollable containers — shorter on mobile */
+        .ud-scroll {
+            max-height: 55vh !important;
+        }
+    }
+
+    /* ── Tablet (769-1024px) ── */
+    @media (min-width: 769px) and (max-width: 1024px) {
+        .newsagent-logo {
+            font-size: 1.35rem !important;
+        }
+        .article-card {
+            padding: 8px 12px !important;
+        }
+        .stTabs [data-baseweb="tab"] {
+            font-size: 0.72rem !important;
+            padding: 7px 12px !important;
+        }
+    }
+
     /* ── Global scrollbar ── */
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -2515,7 +2672,7 @@ st.set_page_config(page_title="NewsAgent", page_icon="📡", layout="wide", init
 st.markdown(DARK_CSS, unsafe_allow_html=True)
 
 settings = load_settings()
-REFRESH = settings.get("general", {}).get("refresh_interval", 30)
+REFRESH = settings.get("general", {}).get("refresh_interval", 15)
 MAX_ART = settings.get("general", {}).get("max_articles", 500)
 PRUNE = settings.get("general", {}).get("prune_after_days", 7)
 
