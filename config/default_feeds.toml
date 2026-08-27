@@ -107,3 +107,82 @@ name = "FinTwit Research"
 url = "https://news.google.com/rss/search?q=%22TENET+research%22+OR+%22HedgeMind%22+OR+%22unusual+whales%22+OR+%22wallstreetbets%22+stock&hl=en-US&gl=US&ceid=US:en"
 category = "general"
 enabled = true
+
+# ── Primary catalyst sources ──────────────────────────────────────────
+# These are where catalysts break first: the filing itself, the company's own
+# press release, the regulator, and the halt tape. Everything else is a retelling.
+
+[[feeds]]
+name = "SEC 8-K Filings"
+url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&count=100&output=atom"
+category = "filing"
+enabled = true
+
+[[feeds]]
+name = "SEC Offerings (424B5)"
+url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=424B5&company=&dateb=&owner=include&count=40&output=atom"
+category = "filing"
+enabled = true
+
+[[feeds]]
+name = "Nasdaq Trading Halts"
+url = "http://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
+category = "filing"
+enabled = true
+
+# GlobeNewswire throttles repeat pollers to a hard timeout — left off by default
+# because a dead feed costs a slot in every refresh cycle. Business Wire and PR
+# Newswire cover the same releases. Flip to true if it starts answering again.
+[[feeds]]
+name = "GlobeNewswire Public Companies"
+url = "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"
+category = "general"
+enabled = false
+
+[[feeds]]
+name = "PR Newswire Releases"
+url = "https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "Business Wire"
+url = "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRVA=="
+category = "general"
+enabled = true
+
+# ── Fast aggregation & press releases ─────────────────────────────────
+# StockTitan carries company press releases as they cross the wire and puts the
+# ticker in the headline. Finviz has no RSS, so it is parsed from HTML — its
+# news table links straight to the original publisher, which is why a story it
+# surfaces scores as Reuters or WSJ rather than as Finviz.
+
+[[feeds]]
+name = "StockTitan Press Releases"
+url = "https://www.stocktitan.net/rss/"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "Finviz News"
+url = "https://finviz.com/news.ashx"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "MarketWatch Real-Time Headlines"
+url = "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "MarketWatch Market Pulse"
+url = "https://feeds.content.dowjones.io/public/rss/mw_marketpulse"
+category = "general"
+enabled = true
+
+[[feeds]]
+name = "CNBC Finance"
+url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"
+category = "general"
+enabled = true

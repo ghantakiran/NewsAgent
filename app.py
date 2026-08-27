@@ -7,10 +7,13 @@ import hashlib
 import html as html_mod
 import json
 import logging
+import os
 import re
 import sqlite3
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -28,6 +31,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("newsagent")
 
 ROOT = Path(__file__).parent
+
+# The catalyst engine lives in src/ so the FastAPI backend can share it.
+sys.path.insert(0, str(ROOT / "src"))
+from newsagent.catalysts import fanout as fanout_mod  # noqa: E402
+from newsagent.catalysts import grok as grok_mod  # noqa: E402
+from newsagent.catalysts import sources as sources_mod  # noqa: E402
+from newsagent.catalysts import (  # noqa: E402
+    SPECS as CATALYST_SPECS,
+    CatalystEngine,
+    CatalystGroup,
+    CatalystType,
+    catalyst_stats,
+    get_catalysts,
+    init_catalyst_tables,
+    prune_catalysts,
+    prune_stale_catalysts,
+    upsert_catalysts,
+)
 
 # ══════════════════════════════════════════════════════════════════════
 #  Timezone support
@@ -151,6 +172,9 @@ class Article:
     tickers: list[str] = field(default_factory=list)
     summary: str = ""
     fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Symbol of the per-ticker page this came from, when fan-out fetched it.
+    # Only a hint — the catalyst engine prefers what the headline itself names.
+    ticker_hint: str = ""
 
 
 @dataclass
@@ -884,6 +908,18 @@ def clean_html(raw: str) -> str:
     return BeautifulSoup(raw, "html.parser").get_text(separator=" ", strip=True)[:500]
 
 
+def _entry_id(feed: Feed, url: str, title: str, summary: str) -> str:
+    """Stable per-item id.
+
+    URL alone is not unique on structured feeds — every Nasdaq halt links to the
+    same page, and an untitled item would collapse into one row. Those feeds key
+    off the item's own text instead, which stays deterministic across refreshes.
+    """
+    if url and "halt" not in feed.name.lower():
+        return hashlib.md5(url.encode()).hexdigest()
+    return hashlib.md5(f"{feed.name}|{title}|{summary[:120]}".encode()).hexdigest()
+
+
 def parse_entry(entry: dict, feed: Feed) -> Article:
     title = entry.get("title", "No title")
     url = entry.get("link", "")
@@ -891,11 +927,16 @@ def parse_entry(entry: dict, feed: Feed) -> Article:
     published = parse_published_date(entry)
     category = categorize(title, summary, feed.category)
     tickers = extract_tickers(title + " " + summary)
+    # Aggregators link to the original publisher, so an item may name its own
+    # source. Crediting Reuters rather than the aggregator is what lets source
+    # authority scoring mean anything.
+    source = entry.get("_source") or feed.name
     return Article(
-        id=hashlib.md5(url.encode()).hexdigest(),
-        title=title, url=url, source=feed.name,
+        id=_entry_id(feed, url, title, summary),
+        title=title, url=url, source=source,
         published=published, category=category,
         tickers=tickers, summary=summary,
+        ticker_hint=entry.get("_ticker_hint", ""),
     )
 
 
@@ -982,7 +1023,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             source TEXT NOT NULL, published TEXT NOT NULL,
             category TEXT NOT NULL DEFAULT 'general',
             tickers TEXT NOT NULL DEFAULT '[]',
-            summary TEXT NOT NULL DEFAULT '', fetched_at TEXT NOT NULL
+            summary TEXT NOT NULL DEFAULT '', fetched_at TEXT NOT NULL,
+            ticker_hint TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS upgrades_downgrades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -996,11 +1038,36 @@ def init_db(conn: sqlite3.Connection) -> None:
             category TEXT NOT NULL DEFAULT 'general',
             enabled INTEGER NOT NULL DEFAULT 1
         );
+        CREATE TABLE IF NOT EXISTS discord_routes (
+            category TEXT PRIMARY KEY,
+            webhook_url TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            disabled INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS discord_sent (
+            article_id TEXT PRIMARY KEY,
+            category TEXT,
+            sent_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(published DESC);
         CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category);
         CREATE INDEX IF NOT EXISTS idx_ud_published ON upgrades_downgrades(published DESC);
+        CREATE INDEX IF NOT EXISTS idx_discord_sent_at ON discord_sent(sent_at DESC);
     """)
+    _add_missing_columns(conn, "articles", {"ticker_hint": "TEXT NOT NULL DEFAULT ''"})
+    init_catalyst_tables(conn)
     conn.commit()
+
+
+def _add_missing_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    """Additive migration for databases created before a column existed."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, spec in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {spec}")
+            logger.info("migrated %s: added column %s", table, name)
 
 
 def prune_old_articles(conn: sqlite3.Connection, days: int = 7) -> None:
@@ -1010,13 +1077,73 @@ def prune_old_articles(conn: sqlite3.Connection, days: int = 7) -> None:
     conn.commit()
 
 
+# ── Discord routes (per-category webhook config; the backend service delivers) ──
+
+# Hex colors mirror models.CATEGORY_COLORS so a test embed matches the UI badge.
+_DISCORD_COLORS = {
+    "general": 0x9E9E9E, "earnings": 0xFFD700, "upgrade": 0x00C853,
+    "downgrade": 0xFF1744, "macro": 0x2979FF, "fda": 0xAA00FF,
+    "m&a": 0xFF9100, "ipo": 0x00E5FF, "insider": 0xFF6D00,
+    "dividend": 0x76FF03, "filing": 0x8D6E63, "crypto": 0xF4511E,
+    "tech": 0x7C4DFF,
+}
+
+
+def get_discord_routes(conn) -> dict[str, dict]:
+    return {r["category"]: dict(r) for r in conn.execute("SELECT * FROM discord_routes").fetchall()}
+
+
+def save_discord_route(conn, category: str, webhook_url: str, enabled: bool = True) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO discord_routes (category, webhook_url, enabled, fail_count, disabled, updated_at) "
+        "VALUES (?, ?, ?, 0, 0, ?)",
+        (category, webhook_url.strip(), int(enabled), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def set_discord_route_enabled(conn, category: str, enabled: bool) -> None:
+    conn.execute("UPDATE discord_routes SET enabled = ? WHERE category = ?", (int(enabled), category))
+    conn.commit()
+
+
+def delete_discord_route(conn, category: str) -> None:
+    conn.execute("DELETE FROM discord_routes WHERE category = ?", (category,))
+    conn.commit()
+
+
+def discord_test_send(webhook_url: str, category: str = "general") -> tuple[bool, str]:
+    """Synchronously POST a test embed so the user can confirm a webhook works."""
+    color = _DISCORD_COLORS.get(category, _DISCORD_COLORS["general"])
+    payload = {
+        "username": "NewsAgent Squawk",
+        "embeds": [{
+            "title": f"✅ NewsAgent connected — {category}",
+            "description": "This channel will now receive NewsAgent market news for this category.",
+            "color": color,
+        }],
+    }
+    try:
+        resp = httpx.post(webhook_url.strip(), json=payload, timeout=10)
+        if resp.status_code in (200, 204):
+            return True, "Test message delivered"
+        if resp.status_code in (401, 404):
+            return False, f"Invalid or deleted webhook ({resp.status_code})"
+        if resp.status_code == 429:
+            return False, "Rate limited (429) — try again shortly"
+        return False, f"Discord returned {resp.status_code}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
 def insert_article(conn: sqlite3.Connection, article: Article) -> bool:
     try:
         cur = conn.execute(
-            "INSERT OR IGNORE INTO articles (id,title,url,source,published,category,tickers,summary,fetched_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO articles (id,title,url,source,published,category,tickers,summary,fetched_at,ticker_hint) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (article.id, article.title, article.url, article.source,
              article.published.isoformat(), article.category.value,
-             json.dumps(article.tickers), article.summary, article.fetched_at.isoformat()),
+             json.dumps(article.tickers), article.summary, article.fetched_at.isoformat(),
+             article.ticker_hint),
         )
         conn.commit()
         return cur.rowcount > 0
@@ -1225,9 +1352,45 @@ def get_fetch_errors() -> dict[str, str]:
     return dict(_fetch_errors)
 
 
-def fetch_feed(feed: Feed, timeout: float = 15.0) -> list[dict]:
+# SEC rejects terse or browser-spoofing agents with a 403; it wants a
+# descriptive string identifying the requester.
+SEC_USER_AGENT = "NewsAgent/1.0 (open-source market news aggregator; contact via repo)"
+DEFAULT_USER_AGENT = "NewsAgent/1.0"
+
+
+def feed_user_agent(url: str) -> str:
+    return SEC_USER_AGENT if "sec.gov" in url else DEFAULT_USER_AGENT
+
+
+def _items_to_entries(items) -> list[dict]:
+    """Adapt NewsItem objects to the entry shape `parse_entry` consumes."""
+    return [
+        {
+            "title": i.title, "link": i.url, "summary": i.summary,
+            "published": i.published.isoformat(),
+            "_source": i.source, "_ticker_hint": i.ticker_hint,
+        }
+        for i in items
+    ]
+
+
+def fetch_feed(feed: Feed, timeout: float = 20.0) -> list[dict]:
+    # Sources without a feed get a purpose-built adapter but the same interface.
+    if "finviz" in feed.name.lower():
+        try:
+            entries = _items_to_entries(sources_mod.fetch_finviz_news(limit=100))
+            if entries:
+                _fetch_errors.pop(feed.name, None)
+            return entries
+        except Exception as e:
+            _fetch_errors[feed.name] = str(e)[:200]
+            logger.warning(f"Error fetching {feed.name}: {str(e)[:100]}")
+            return []
     try:
-        headers = {"User-Agent": "NewsAgent/1.0", "Accept": "application/rss+xml, application/xml, text/xml, */*"}
+        headers = {
+            "User-Agent": feed_user_agent(feed.url),
+            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+        }
         with httpx.Client(timeout=timeout, follow_redirects=True) as client:
             resp = client.get(feed.url, headers=headers)
             resp.raise_for_status()
@@ -1242,14 +1405,159 @@ def fetch_feed(feed: Feed, timeout: float = 15.0) -> list[dict]:
         return []
 
 
-def fetch_all_feeds(feeds: list[Feed]) -> int:
+# ══════════════════════════════════════════════════════════════════════
+#  Catalyst engine wiring
+# ══════════════════════════════════════════════════════════════════════
+
+# Grok reads X, where a halt or a leak often surfaces before any wire carries
+# it. Off unless XAI_API_KEY is set; the interval keeps the spend bounded.
+GROK_SQUAWK_ENABLED = os.getenv("GROK_SQUAWK_ENABLED", "true").lower() in ("1", "true", "yes")
+GROK_SQUAWK_INTERVAL = float(os.getenv("GROK_SQUAWK_INTERVAL", "120"))
+GROK_SQUAWK_WINDOW_MINUTES = int(os.getenv("GROK_SQUAWK_WINDOW_MINUTES", "30"))
+# Per-ticker fan-out is heavier than a feed poll, so it runs on its own cadence.
+TICKER_FANOUT_INTERVAL = float(os.getenv("TICKER_FANOUT_INTERVAL", "90"))
+TICKER_FANOUT_MAX = int(os.getenv("TICKER_FANOUT_MAX", "10"))
+
+
+def store_news_items(items, feed_name: str, category: str = "general") -> int:
+    """Persist NewsItems from a non-RSS source. Returns how many were new."""
+    if not items:
+        return 0
+    pseudo_feed = Feed(name=feed_name, url="", category=category, enabled=True)
+    conn = get_connection()
+    try:
+        init_db(conn)
+        stored = 0
+        for entry in _items_to_entries(items):
+            try:
+                if insert_article(conn, parse_entry(entry, pseudo_feed)):
+                    stored += 1
+            except Exception as exc:
+                logger.debug("could not store item from %s: %s", feed_name, exc)
+        return stored
+    finally:
+        conn.close()
+
+
+def focus_tickers(limit: int = TICKER_FANOUT_MAX) -> list[str]:
+    """Which symbols deserve a dedicated sweep right now.
+
+    Watchlist first — those are the ones the user is actually trading — then the
+    tickers already carrying the highest-scoring catalysts, since a live story
+    is exactly where extra sourcing pays off.
+    """
+    picks: list[str] = []
+    try:
+        # Reachable only from a Streamlit script run; the refresher thread has
+        # no session context, and falls through to the catalyst board instead.
+        watchlist = st.session_state.get("watchlist", []) or []
+    except Exception:
+        watchlist = []
+    for ticker in watchlist:
+        if ticker and ticker not in picks:
+            picks.append(ticker)
+    if len(picks) < limit:
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT ticker FROM catalysts WHERE ticker != '' AND published >= ? "
+                "ORDER BY score DESC LIMIT ?",
+                ((datetime.now(timezone.utc) - timedelta(hours=12)).isoformat(), limit * 2),
+            ).fetchall()
+            for row in rows:
+                if row[0] not in picks:
+                    picks.append(row[0])
+                if len(picks) >= limit:
+                    break
+        except Exception as exc:
+            logger.debug("focus ticker lookup failed: %s", exc)
+        finally:
+            conn.close()
+    return picks[:limit]
+
+
+_catalyst_engine: CatalystEngine | None = None
+_catalyst_lock = threading.Lock()
+_last_catalyst_run: datetime | None = None
+_last_catalyst_counts: tuple[int, int] = (0, 0)
+
+# Company aliases the SEC file spells differently from the newswires.
+CATALYST_NAME_ALIASES = dict(COMPANY_TO_TICKER)
+
+
+def get_catalyst_engine() -> CatalystEngine:
+    """Lazily build the engine; the SEC ticker universe loads once per process."""
+    global _catalyst_engine
+    if _catalyst_engine is None:
+        with _catalyst_lock:
+            if _catalyst_engine is None:
+                _catalyst_engine = CatalystEngine(DB_DIR, extra_names=CATALYST_NAME_ALIASES)
+    return _catalyst_engine
+
+
+def refresh_catalysts(hours: float = 48, with_quotes: bool = True) -> tuple[int, int]:
+    """Re-derive catalysts from the cached articles and persist the ranking.
+
+    Runs after each feed fetch. Quotes are attached only for the top-ranked
+    tickers so a refresh costs a bounded number of requests regardless of how
+    much news arrived.
+    """
+    global _last_catalyst_run, _last_catalyst_counts
+    conn = get_connection()
+    try:
+        init_catalyst_tables(conn)
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        rows = conn.execute(
+            "SELECT id, title, summary, source, url, published, ticker_hint FROM articles "
+            "WHERE published >= ? ORDER BY published DESC LIMIT 2000",
+            (cutoff,),
+        ).fetchall()
+        articles = [
+            {"id": r[0], "title": r[1], "summary": r[2], "source": r[3], "url": r[4],
+             "published": r[5], "ticker_hint": r[6]}
+            for r in rows
+        ]
+        catalysts = get_catalyst_engine().run(articles, with_quotes=with_quotes)
+        counts = upsert_catalysts(conn, catalysts)
+        # Keep the board equal to this scan's output — see prune_stale_catalysts.
+        prune_stale_catalysts(conn, [c.id for c in catalysts], hours)
+        _last_catalyst_run = datetime.now(timezone.utc)
+        _last_catalyst_counts = counts
+        return counts
+    except Exception as exc:
+        logger.warning("catalyst refresh failed: %s", exc)
+        return (0, 0)
+    finally:
+        conn.close()
+
+
+def get_last_catalyst_run() -> datetime | None:
+    return _last_catalyst_run
+
+
+# Feeds are fetched concurrently: sequentially, one slow wire (or a 20s timeout)
+# would stretch a cycle past the refresh interval and the refresher would hold
+# the fetch lock permanently, starving the UI thread that renders the first page.
+FETCH_WORKERS = 8
+
+
+def fetch_all_feeds(feeds: list[Feed], blocking: bool = True) -> int:
+    """Fetch every enabled feed and store new articles. Returns the new count.
+
+    With `blocking=False` a fetch already in flight is left to finish rather
+    than queueing a second one behind it.
+    """
     global _last_fetch_time
-    with _fetch_lock:
+    if not _fetch_lock.acquire(blocking=blocking):
+        return 0
+    try:
+        enabled = [f for f in feeds if f.enabled]
+        with ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, max(1, len(enabled)))) as pool:
+            fetched = list(zip(enabled, pool.map(fetch_feed, enabled)))
+
         conn = get_connection(); init_db(conn); new_count = 0
-        for feed in feeds:
-            if not feed.enabled:
-                continue
-            for entry in fetch_feed(feed):
+        for feed, entries in fetched:
+            for entry in entries:
                 try:
                     article = parse_entry(entry, feed)
                     if insert_article(conn, article):
@@ -1266,13 +1574,27 @@ def fetch_all_feeds(feeds: list[Feed]) -> int:
         conn.close()
         _last_fetch_time = datetime.now(timezone.utc)
         return new_count
+    finally:
+        _fetch_lock.release()
 
 
 class FeedRefresher:
+    """Tiered background refresh.
+
+    Sources are not equally fast. The wires, SEC and the halt tape are where
+    catalysts originate; general market news mostly re-reports them minutes
+    later. Polling everything on one interval makes the fast sources queue
+    behind the slow ones, so each tier runs at its own cadence and only the
+    tiers that are due are fetched on a given pass.
+    """
+
     def __init__(self, feeds: list[Feed], interval: int = 15):
         self.feeds = feeds
         self.interval = interval
         self._running = False
+        self._scheduler = fanout_mod.TieredScheduler()
+        self._last_grok = 0.0
+        self._last_ticker_fanout = 0.0
 
     def start(self):
         if self._running:
@@ -1284,15 +1606,66 @@ class FeedRefresher:
     def stop(self):
         self._running = False
 
+    def _feeds_for(self, tiers) -> list[Feed]:
+        wanted = set(tiers)
+        return [f for f in self.feeds if fanout_mod.tier_for(f.name, f.category) in wanted]
+
     def _run(self):
         while self._running:
             try:
-                new = fetch_all_feeds(self.feeds)
-                if new > 0:
-                    logger.info(f"Fetched {new} new articles")
+                due = self._scheduler.due()
+                if due:
+                    batch = self._feeds_for(due)
+                    new = fetch_all_feeds(batch, blocking=False) if batch else 0
+                    for tier in due:
+                        self._scheduler.mark(tier)
+                    if new > 0:
+                        names = "+".join(t.value for t in due)
+                        logger.info(f"Fetched {new} new articles ({names})")
+
+                self._maybe_grok_squawk()
+                self._maybe_ticker_fanout()
+
+                # Rescore every cycle, not only when articles arrive: recency
+                # decays and quotes go stale even on a quiet feed.
+                fresh, updated = refresh_catalysts()
+                if fresh:
+                    logger.info(f"Detected {fresh} new catalysts ({updated} rescored)")
             except Exception as e:
                 logger.error(f"Refresh error: {e}")
-            time.sleep(self.interval)
+            time.sleep(max(2.0, min(self.interval, self._scheduler.seconds_until_next())))
+
+    def _maybe_grok_squawk(self) -> None:
+        """Pull breaking events off X. Skipped entirely without an API key."""
+        if not GROK_SQUAWK_ENABLED or not grok_mod.available():
+            return
+        if time.monotonic() - self._last_grok < GROK_SQUAWK_INTERVAL:
+            return
+        self._last_grok = time.monotonic()
+        try:
+            items = grok_mod.fetch_squawk(minutes=GROK_SQUAWK_WINDOW_MINUTES)
+            if items:
+                stored = store_news_items(items, "Grok Squawk", "general")
+                if stored:
+                    logger.info(f"Grok squawk: {stored} new events from X")
+        except Exception as e:
+            logger.warning(f"Grok squawk failed: {e}")
+
+    def _maybe_ticker_fanout(self) -> None:
+        """Pull every angle on the symbols that currently matter."""
+        if time.monotonic() - self._last_ticker_fanout < TICKER_FANOUT_INTERVAL:
+            return
+        self._last_ticker_fanout = time.monotonic()
+        try:
+            tickers = focus_tickers()
+            if not tickers:
+                return
+            items = fanout_mod.fanout_tickers(tickers, limit_per_source=15)
+            stored = store_news_items(items, "Ticker Fan-out", "general")
+            if stored:
+                logger.info(f"Fan-out over {len(tickers)} tickers: {stored} new items")
+        except Exception as e:
+            logger.warning(f"Ticker fan-out failed: {e}")
 
     def update_feeds(self, feeds):
         self.feeds = feeds
@@ -2269,6 +2642,293 @@ DARK_CSS = """
         border-radius: var(--radius-lg) !important;
         padding: 1rem !important;
     }
+
+    /* ═══════════════════════════════════════════════════════════════
+       Catalyst Board — ranked, scored, price-confirmed events
+       ═══════════════════════════════════════════════════════════════ */
+
+    .cat-card {
+        display: flex;
+        gap: 12px;
+        padding: 11px 14px 11px 12px;
+        border-bottom: 1px solid var(--border-subtle);
+        border-left: 2px solid var(--cat-accent, var(--border-medium));
+        transition: background 0.18s ease, border-color 0.18s ease;
+        align-items: flex-start;
+    }
+    .cat-card:hover {
+        background: linear-gradient(90deg, var(--bg-hover) 0%, transparent 90%);
+        border-bottom-color: var(--border-medium);
+    }
+
+    /* Score chip — the headline number */
+    .cat-score {
+        flex: 0 0 auto;
+        width: 42px;
+        text-align: center;
+        font-family: var(--font-mono);
+        font-weight: 800;
+        font-size: 1.02rem;
+        line-height: 1;
+        padding: 7px 0 6px;
+        border-radius: var(--radius-md);
+        border: 1px solid var(--cat-accent, var(--border-medium));
+        background: var(--cat-accent-dim, rgba(255,255,255,0.03));
+        color: var(--cat-accent, var(--text-secondary));
+        cursor: help;
+    }
+    .cat-score small {
+        display: block;
+        font-size: 0.5rem;
+        font-weight: 600;
+        letter-spacing: 0.8px;
+        color: var(--text-dim);
+        margin-top: 3px;
+        text-transform: uppercase;
+    }
+
+    .cat-body { flex: 1 1 auto; min-width: 0; }
+
+    .cat-meta {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        flex-wrap: wrap;
+        margin-bottom: 4px;
+    }
+    .cat-ticker {
+        font-family: var(--font-mono);
+        font-weight: 800;
+        font-size: 0.82rem;
+        letter-spacing: 0.7px;
+        color: var(--text-primary);
+    }
+    .cat-ticker.none { color: var(--text-dim); font-weight: 600; }
+
+    .cat-type {
+        padding: 2px 9px;
+        border-radius: 100px;
+        font-size: 0.62rem;
+        font-weight: 700;
+        letter-spacing: 0.6px;
+        text-transform: uppercase;
+        white-space: nowrap;
+    }
+
+    /* Price confirmation */
+    .cat-move {
+        font-family: var(--font-mono);
+        font-size: 0.74rem;
+        font-weight: 700;
+        padding: 1px 7px;
+        border-radius: var(--radius-sm);
+    }
+    .cat-move.up   { color: var(--accent-green); background: var(--accent-green-dim); }
+    .cat-move.down { color: var(--accent-red);   background: var(--accent-red-glow); }
+    .cat-move.flat { color: var(--text-muted);   background: rgba(255,255,255,0.03); }
+
+    .cat-rvol {
+        font-family: var(--font-mono);
+        font-size: 0.68rem;
+        font-weight: 600;
+        color: var(--accent-gold);
+        background: var(--accent-gold-dim);
+        padding: 1px 6px;
+        border-radius: var(--radius-sm);
+    }
+    .cat-confirmed {
+        font-size: 0.58rem;
+        font-weight: 800;
+        letter-spacing: 0.9px;
+        color: var(--accent-green);
+        border: 1px solid rgba(0,214,143,0.28);
+        background: var(--accent-green-dim);
+        padding: 1px 6px;
+        border-radius: var(--radius-sm);
+    }
+
+    .cat-spacer { flex: 1 1 auto; }
+    .cat-when {
+        font-family: var(--font-mono);
+        font-size: 0.68rem;
+        color: var(--text-dim);
+        white-space: nowrap;
+    }
+
+    .cat-headline {
+        display: block;
+        color: var(--text-primary);
+        font-size: 0.88rem;
+        line-height: 1.45;
+        text-decoration: none;
+        font-weight: 450;
+    }
+    .cat-headline:hover { color: var(--accent-blue); }
+
+    .cat-facts {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-top: 5px;
+    }
+    .cat-fact {
+        font-family: var(--font-mono);
+        font-size: 0.66rem;
+        color: var(--text-muted);
+        background: rgba(255,255,255,0.025);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        padding: 1px 7px;
+    }
+    .cat-fact.sources { color: var(--accent-blue); border-color: rgba(14,165,233,0.18); }
+
+    .cat-empty {
+        text-align: center;
+        color: var(--text-muted);
+        padding: 2.4rem 1rem;
+        font-size: 0.86rem;
+        line-height: 1.7;
+    }
+    .cat-empty b { color: var(--text-secondary); font-weight: 600; }
+
+    /* Board summary strip */
+    .cat-summary {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 2px 0 8px;
+    }
+    .cat-kpi {
+        flex: 1 1 90px;
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        background: var(--bg-secondary);
+        padding: 7px 10px;
+    }
+    .cat-kpi-value {
+        font-family: var(--font-mono);
+        font-size: 1.1rem;
+        font-weight: 800;
+        color: var(--text-primary);
+        line-height: 1.1;
+    }
+    .cat-kpi-label {
+        font-size: 0.6rem;
+        letter-spacing: 0.8px;
+        text-transform: uppercase;
+        color: var(--text-dim);
+        font-weight: 600;
+        margin-top: 2px;
+    }
+
+    @media (max-width: 768px) {
+        .cat-card { padding: 9px 10px 9px 9px; gap: 9px; }
+        .cat-score { width: 36px; font-size: 0.9rem; }
+        .cat-headline { font-size: 0.82rem; }
+        .cat-when { display: none; }
+    }
+
+
+    /* ═══════════════════════════════════════════════════════════════
+       Squawk tape — chronological, latency-first catalyst stream
+       ═══════════════════════════════════════════════════════════════ */
+
+    .squawk-row {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        padding: 7px 12px;
+        border-bottom: 1px solid var(--border-subtle);
+        border-left: 2px solid var(--sq-accent, transparent);
+        font-size: 0.85rem;
+        line-height: 1.5;
+        transition: background 0.15s ease;
+    }
+    .squawk-row:hover { background: var(--bg-hover); }
+    .squawk-row.fresh {
+        background: linear-gradient(90deg, rgba(255,59,78,0.06) 0%, transparent 70%);
+    }
+
+    /* Age is the headline metric on a squawk tape, so it leads the row. */
+    .squawk-age {
+        flex: 0 0 auto;
+        min-width: 46px;
+        text-align: right;
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+        font-weight: 700;
+        color: var(--text-dim);
+    }
+    .squawk-age.hot  { color: var(--accent-red); }
+    .squawk-age.warm { color: var(--accent-gold); }
+
+    .squawk-ticker {
+        flex: 0 0 auto;
+        min-width: 52px;
+        font-family: var(--font-mono);
+        font-weight: 800;
+        font-size: 0.8rem;
+        letter-spacing: 0.6px;
+        color: var(--text-primary);
+    }
+    .squawk-ticker.none { color: var(--text-dim); font-weight: 600; }
+
+    .squawk-tag {
+        flex: 0 0 auto;
+        padding: 1px 7px;
+        border-radius: 100px;
+        font-size: 0.59rem;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+        white-space: nowrap;
+    }
+    .squawk-headline {
+        flex: 1 1 auto;
+        min-width: 0;
+        color: var(--text-primary);
+        text-decoration: none;
+    }
+    .squawk-headline:hover { color: var(--accent-blue); }
+    .squawk-move {
+        flex: 0 0 auto;
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+        font-weight: 700;
+    }
+    .squawk-move.up { color: var(--accent-green); }
+    .squawk-move.down { color: var(--accent-red); }
+    .squawk-src {
+        flex: 0 0 auto;
+        font-size: 0.65rem;
+        color: var(--text-dim);
+        font-family: var(--font-mono);
+        white-space: nowrap;
+    }
+    .squawk-src.primary { color: var(--accent-blue); }
+
+    .latency-bar {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+    }
+    .latency-chip {
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        background: var(--bg-secondary);
+        padding: 5px 10px;
+        font-size: 0.68rem;
+        color: var(--text-muted);
+        font-family: var(--font-mono);
+    }
+    .latency-chip b { color: var(--text-primary); font-weight: 700; }
+
+    @media (max-width: 768px) {
+        .squawk-row { padding: 6px 8px; gap: 7px; font-size: 0.79rem; }
+        .squawk-src { display: none; }
+    }
+
 </style>
 """
 
@@ -2443,6 +3103,298 @@ def render_uds(uds: list[UpgradeDowngrade], scrollable: bool = False):
     if scrollable:
         html = f'<div class="ud-scroll">{html}</div>'
     st.markdown(html, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Catalyst Board rendering
+# ══════════════════════════════════════════════════════════════════════
+
+# Score bands. The colour answers "do I need to look at this right now?"
+_SCORE_BANDS = (
+    (80, "#ff3b4e", "rgba(255,59,78,0.10)", "CRITICAL"),
+    (65, "#f5c542", "rgba(245,197,66,0.10)", "HIGH"),
+    (50, "#0ea5e9", "rgba(14,165,233,0.10)", "NOTABLE"),
+    (0,  "#5c6375", "rgba(255,255,255,0.03)", "LOW"),
+)
+
+
+def score_band(score: float) -> tuple[str, str, str]:
+    for threshold, color, dim, label in _SCORE_BANDS:
+        if score >= threshold:
+            return color, dim, label
+    return _SCORE_BANDS[-1][1:]
+
+
+def _score_tooltip(c: dict) -> str:
+    """Human-readable derivation, shown on hover over the score chip."""
+    parts = c.get("score_parts") or {}
+    if not parts:
+        return f"Impact score {c.get('score', 0)}"
+    base = parts.get("base", 0)
+    order = ("detection", "ticker", "source", "recency", "corroboration", "size", "price")
+    names = {
+        "detection": "match confidence", "ticker": "ticker certainty",
+        "source": "source authority", "recency": "freshness",
+        "corroboration": "corroboration", "size": "float sensitivity",
+        "price": "price confirmation",
+    }
+    lines = [f"{c.get('label', 'Catalyst')} base impact {base:g}"]
+    lines += [f"x {parts[k]:g} {names[k]}" for k in order if k in parts]
+    lines.append(f"= {c.get('score', 0):g} / 100")
+    return "  ".join(lines)
+
+
+def _render_catalyst_html(c: dict) -> str:
+    score = float(c.get("score") or 0)
+    color, dim, band = score_band(score)
+    type_color = c.get("color") or "#8b93b0"
+    ticker = c.get("ticker") or ""
+
+    move_html = ""
+    change = c.get("change_pct")
+    if change is not None:
+        cls = "up" if change > 0.05 else ("down" if change < -0.05 else "flat")
+        move_html = f'<span class="cat-move {cls}">{change:+.2f}%</span>'
+    rvol = c.get("rel_volume") or 0
+    rvol_html = f'<span class="cat-rvol">{rvol:.1f}x vol</span>' if rvol >= 1.5 else ""
+    confirmed_html = '<span class="cat-confirmed">CONFIRMED</span>' if c.get("confirmed") else ""
+
+    published = _parse_dt(c["published"]) if isinstance(c.get("published"), str) else c.get("published")
+    when = f'{_format_time(published, "%H:%M")} · {_relative_time(published)}' if published else ""
+
+    facts = []
+    n_sources = int(c.get("source_count") or 1)
+    if n_sources > 1:
+        facts.append(f'<span class="cat-fact sources">{n_sources} sources</span>')
+    headline = c.get("headline", "")
+    for key, value in (c.get("facts") or {}).items():
+        # Filing form and company already read in the headline for SEC items.
+        if key in ("company", "filing") or str(value) in headline:
+            continue
+        text = str(value)
+        if key == "items":
+            extra = text.split(", ")
+            text = ", ".join(extra[:3]) + (f" +{len(extra) - 3}" if len(extra) > 3 else "")
+        facts.append(f'<span class="cat-fact">{_esc(text)}</span>')
+    sources = c.get("sources") or []
+    if sources:
+        facts.append(f'<span class="cat-fact">{_esc(_short_source(sources[0].get("source", "")))}</span>')
+    if c.get("company") and ticker and c["company"][:20].lower() not in headline.lower():
+        facts.append(f'<span class="cat-fact">{_esc(c["company"][:36])}</span>')
+
+    ticker_html = (
+        f'<span class="cat-ticker">{_esc(ticker)}</span>' if ticker
+        else '<span class="cat-ticker none">MARKET</span>'
+    )
+    return (
+        f'<div class="cat-card" style="--cat-accent:{color};--cat-accent-dim:{dim}">'
+        f'<div class="cat-score" title="{_esc(_score_tooltip(c))}">{score:.0f}<small>{band}</small></div>'
+        f'<div class="cat-body">'
+        f'<div class="cat-meta">{ticker_html}'
+        f'<span class="cat-type" style="background:{type_color}14;color:{type_color};'
+        f'border:1px solid {type_color}30">{_esc(c.get("label", ""))}</span>'
+        f'{move_html}{rvol_html}{confirmed_html}'
+        f'<span class="cat-spacer"></span><span class="cat-when">{when}</span></div>'
+        f'<a href="{_esc(c.get("url") or "#")}" target="_blank" class="cat-headline">'
+        f'{_esc(c.get("headline", ""))}</a>'
+        f'<div class="cat-facts">{"".join(facts)}</div>'
+        f'</div></div>'
+    )
+
+
+def render_catalysts(catalysts: list[dict], empty_hint: str = "") -> None:
+    if not catalysts:
+        st.markdown(
+            f'<div class="cat-empty"><b>No catalysts match these filters.</b><br>{empty_hint}</div>',
+            unsafe_allow_html=True,
+        )
+        return
+    st.markdown("\n".join(_render_catalyst_html(c) for c in catalysts), unsafe_allow_html=True)
+
+
+def render_catalyst_kpis(stats: dict) -> None:
+    tiles = (
+        ("Events (24h)", stats.get("total", 0)),
+        ("High impact", stats.get("high_impact", 0)),
+        ("Price confirmed", stats.get("confirmed", 0)),
+        ("Tickers", stats.get("tickers", 0)),
+    )
+    st.markdown(
+        '<div class="cat-summary">'
+        + "".join(
+            f'<div class="cat-kpi"><div class="cat-kpi-value">{value}</div>'
+            f'<div class="cat-kpi-label">{label}</div></div>'
+            for label, value in tiles
+        )
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Squawk tape — the fastest catalyst information, newest first
+# ══════════════════════════════════════════════════════════════════════
+
+# Sources that originate news rather than re-report it. Something arriving from
+# one of these is as early as a free feed can be.
+PRIMARY_SOURCE_HINTS = (
+    "sec", "edgar", "fda", "halt", "business wire", "businesswire",
+    "pr newswire", "prnewswire", "globenewswire", "stocktitan", "accesswire",
+    "grok squawk",
+)
+
+
+def _is_primary_source(source: str) -> bool:
+    lowered = (source or "").lower()
+    return any(hint in lowered for hint in PRIMARY_SOURCE_HINTS)
+
+
+def _age_label(published: datetime) -> tuple[str, str]:
+    """Compact age plus a heat class — seconds matter on a squawk tape."""
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=timezone.utc)
+    seconds = max(0, int((datetime.now(timezone.utc) - published).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s", "hot"
+    if seconds < 3600:
+        return f"{seconds // 60}m", "warm" if seconds < 900 else ""
+    if seconds < 86400:
+        return f"{seconds // 3600}h", ""
+    return f"{seconds // 86400}d", ""
+
+
+def _render_squawk_row(c: dict) -> str:
+    published = _parse_dt(c["published"]) if isinstance(c.get("published"), str) else c.get("published")
+    age, heat = _age_label(published) if published else ("", "")
+    ticker = c.get("ticker") or ""
+    type_color = c.get("color") or "#8b93b0"
+
+    move = ""
+    change = c.get("change_pct")
+    if change is not None and abs(change) >= 0.05:
+        move = f'<span class="squawk-move {"up" if change > 0 else "down"}">{change:+.1f}%</span>'
+
+    sources = c.get("sources") or []
+    source_name = _short_source(sources[0].get("source", "")) if sources else ""
+    n = int(c.get("source_count") or 1)
+    if n > 1:
+        source_name = f"{source_name}+{n - 1}"
+    primary = " primary" if sources and _is_primary_source(sources[0].get("source", "")) else ""
+
+    return (
+        f'<div class="squawk-row{" fresh" if heat == "hot" else ""}" style="--sq-accent:{type_color}55">'
+        f'<span class="squawk-age {heat}">{age}</span>'
+        f'<span class="squawk-ticker{"" if ticker else " none"}">{_esc(ticker) if ticker else "—"}</span>'
+        f'<span class="squawk-tag" style="background:{type_color}18;color:{type_color}">'
+        f'{_esc(c.get("label", ""))}</span>'
+        f'<a class="squawk-headline" href="{_esc(c.get("url") or "#")}" target="_blank">'
+        f'{_esc(c.get("headline", ""))}</a>'
+        f'{move}'
+        f'<span class="squawk-src{primary}">{_esc(source_name)}</span>'
+        f'</div>'
+    )
+
+
+def render_squawk(catalysts: list[dict]) -> None:
+    if not catalysts:
+        st.markdown(
+            '<div class="cat-empty"><b>Tape is quiet.</b><br>'
+            'Nothing has cleared the filter in this window.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+    st.markdown("\n".join(_render_squawk_row(c) for c in catalysts), unsafe_allow_html=True)
+
+
+def source_latency_stats(conn, hours: float = 6) -> dict:
+    """How fast each tier is actually delivering, measured on stored events."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    rows = conn.execute(
+        "SELECT source, COUNT(*) n FROM articles WHERE published >= ? GROUP BY source ORDER BY n DESC",
+        (cutoff,),
+    ).fetchall()
+    primary = sum(r[1] for r in rows if _is_primary_source(r[0]))
+    total = sum(r[1] for r in rows) or 1
+    newest = conn.execute(
+        "SELECT MAX(published) FROM articles WHERE published <= ?",
+        (datetime.now(timezone.utc).isoformat(),),
+    ).fetchone()[0]
+    freshest = 0
+    if newest:
+        try:
+            freshest = max(0, int((datetime.now(timezone.utc) - _parse_dt(newest)).total_seconds()))
+        except Exception:
+            freshest = 0
+    return {
+        "sources": len(rows),
+        "items": total,
+        "primary_pct": round(primary / total * 100),
+        "freshest_seconds": freshest,
+    }
+
+
+def render_latency_bar(stats: dict, grok_on: bool) -> None:
+    grok_label = "on" if grok_on else "off (set XAI_API_KEY)"
+    st.markdown(
+        '<div class="latency-bar">'
+        f'<span class="latency-chip">newest item <b>{stats["freshest_seconds"]}s</b> ago</span>'
+        f'<span class="latency-chip">from primary sources <b>{stats["primary_pct"]}%</b></span>'
+        f'<span class="latency-chip">live sources <b>{stats["sources"]}</b></span>'
+        f'<span class="latency-chip">items (6h) <b>{stats["items"]}</b></span>'
+        f'<span class="latency-chip">Grok X-search <b>{grok_label}</b></span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_grok_panel() -> None:
+    """Ask Grok what is moving a name, using live X and web search.
+
+    RSS can only carry what someone already published; a halt or a leak usually
+    shows up on X first. This is the manual version of that lookup — the
+    automatic one runs in the refresher when a key is configured.
+    """
+    configured = grok_mod.available()
+    label = "🤖 Ask Grok — why is a stock moving?" if configured else "🤖 Ask Grok (needs XAI_API_KEY)"
+    with st.expander(label, expanded=False):
+        if not configured:
+            st.caption(
+                "Set `XAI_API_KEY` in your environment to enable live X and web search. "
+                "Grok reads posts and articles as they appear, which is usually ahead of "
+                "any RSS feed. Everything else on this page works without it."
+            )
+            return
+
+        c1, c2, c3 = st.columns([2, 2, 4])
+        with c1:
+            ticker = st.text_input("Ticker", placeholder="e.g. NVDA", max_chars=6,
+                                   key="grok_ticker", label_visibility="collapsed").upper().strip()
+        with c2:
+            asked = st.button("Explain the move", key="grok_go", use_container_width=True)
+        with c3:
+            if st.button("Sweep X for breaking events now", key="grok_sweep", use_container_width=True):
+                with st.spinner("Searching X and the web..."):
+                    items = grok_mod.fetch_squawk(
+                        minutes=GROK_SQUAWK_WINDOW_MINUTES, respect_throttle=False
+                    )
+                    stored = store_news_items(items, "Grok Squawk", "general")
+                    refresh_catalysts(with_quotes=False)
+                st.success(f"{len(items)} events found, {stored} new on the tape.")
+
+        if asked and ticker:
+            with st.spinner(f"Asking Grok about {ticker}..."):
+                answer = grok_mod.explain_move(ticker, 0.0, respect_throttle=False)
+            if answer.ok:
+                st.markdown(answer.text)
+                if answer.citations:
+                    st.caption("Sources: " + " · ".join(
+                        f"[{_short_source(sources_mod.source_for_url(u, 'link'))}]({u})"
+                        for u in answer.citations[:6]
+                    ))
+            else:
+                st.warning(f"Grok could not answer: {answer.error}")
+        elif asked:
+            st.info("Enter a ticker first.")
 
 
 def render_stat(label, value):
@@ -2691,7 +3643,17 @@ feeds = load_all_feeds()
 
 if not st.session_state.refresher_started:
     # Do an initial synchronous fetch so articles are available immediately
-    fetch_all_feeds(feeds)
+    # Only the fast tiers on the critical path — the slower aggregators land on
+    # the next background pass rather than delaying the first paint.
+    _startup_tiers = {fanout_mod.Tier.FLASH, fanout_mod.Tier.FAST}
+    fetch_all_feeds(
+        [f for f in feeds if fanout_mod.tier_for(f.name, f.category) in _startup_tiers],
+        blocking=False,
+    )
+    prune_catalysts(conn, PRUNE)
+    # Quotes are skipped on the first pass so the board paints immediately; the
+    # background refresher attaches them (and rescores) moments later.
+    refresh_catalysts(with_quotes=False)
     r = FeedRefresher(feeds, interval=REFRESH)
     r.start()
     st.session_state.refresher_started = True
@@ -2747,6 +3709,9 @@ with st.sidebar:
             st.session_state.watchlist.pop(i); st.rerun()
     st.divider()
     st.markdown("### Stats")
+    _cstats = catalyst_stats(conn, hours=24)
+    render_stat("Catalysts (24h)", _cstats.get("total", 0))
+    render_stat("High Impact", _cstats.get("high_impact", 0))
     render_stat("Articles Cached", get_article_count(conn))
     sc = get_source_counts(conn)
     if sc:
@@ -2888,34 +3853,133 @@ def frag_ud():
     fc.close()
 
 
-@st.fragment(run_every=timedelta(seconds=REFRESH))
-def frag_cat():
+@st.fragment(run_every=timedelta(seconds=max(5, REFRESH // 2)))
+def frag_squawk():
+    """The tape: every catalyst as it lands, newest first, age in seconds."""
     fc = get_connection()
-    cats = ["earnings", "fda", "m&a", "ipo", "insider", "dividend", "filing"]
-    sel = st.selectbox("Catalyst Type", ["all"] + cats, key="ct", label_visibility="collapsed")
-    if sel == "all":
-        arts = []
-        for c in cats:
-            arts.extend(get_articles(fc, limit=50, category=c))
-        arts.sort(key=lambda a: a.published.replace(tzinfo=timezone.utc) if a.published.tzinfo is None else a.published, reverse=True)
-        arts = arts[:100]
-    else:
-        arts = get_articles(fc, limit=100, category=sel)
-    lf = get_last_fetch_time()
-    if lf:
-        lf_time = _format_time(lf, "%H:%M:%S")
-        lf_rel = _relative_time(lf)
-        cat_status = f"Last fetch: {lf_time} {_tz_abbrev()} ({lf_rel})"
-    else:
-        cat_status = "Fetching..."
+
+    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    with c1:
+        query = st.text_input(
+            "Filter tape", placeholder="Ticker, company or headline...",
+            label_visibility="collapsed", key="sq_q",
+        ).strip()
+    with c2:
+        window = st.selectbox("Window", ["2h", "6h", "30m", "24h"], key="sq_win", label_visibility="collapsed")
+    with c3:
+        floor = st.selectbox(
+            "Filter", ["Catalysts only", "High impact only", "Everything scored"],
+            key="sq_floor", label_visibility="collapsed",
+        )
+    with c4:
+        watch_only = st.checkbox("Watchlist only", key="sq_watch")
+
+    hours = {"30m": 0.5, "2h": 2, "6h": 6, "24h": 24}[window]
+    min_score = {"Catalysts only": 25, "High impact only": 60, "Everything scored": 0}[floor]
+
+    render_latency_bar(source_latency_stats(fc, hours=6), grok_mod.available())
+    render_grok_panel()
+
+    catalysts = get_catalysts(
+        fc, hours=hours, min_score=min_score,
+        search=query or None,
+        tickers=(st.session_state.watchlist or None) if watch_only else None,
+        order="time", limit=200,
+    )
+
+    last_run = get_last_catalyst_run()
+    scanned = f"{_relative_time(last_run)}" if last_run else "starting..."
     st.markdown(
         f'<div class="refresh-bar">'
-        f'<span><span class="refresh-dot"></span>{len(arts)} catalyst events</span>'
-        f'<span>{cat_status} · refreshes every {REFRESH}s</span>'
+        f'<span><span class="refresh-dot"></span>{len(catalysts)} events on the tape · last {window}</span>'
+        f'<span>scanned {scanned} · tiers: flash 10s / fast 45s / steady 180s</span>'
         f'</div>',
         unsafe_allow_html=True,
     )
-    render_articles(arts)
+    render_squawk(catalysts)
+    fc.close()
+
+
+@st.fragment(run_every=timedelta(seconds=REFRESH))
+def frag_cat():
+    """Catalyst Board — every detected event, ranked by how much it should move the stock."""
+    fc = get_connection()
+
+    group_labels = {
+        "All": None,
+        "Deals": CatalystGroup.DEAL.value,
+        "Clinical": CatalystGroup.CLINICAL.value,
+        "Capital": CatalystGroup.CAPITAL.value,
+        "Operating": CatalystGroup.OPERATING.value,
+        "Legal": CatalystGroup.LEGAL.value,
+        "Structural": CatalystGroup.STRUCTURAL.value,
+        "Analyst": CatalystGroup.ANALYST.value,
+        "Macro": CatalystGroup.MACRO.value,
+    }
+
+    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    with c1:
+        query = st.text_input(
+            "Search catalysts", placeholder="Ticker, company or headline...",
+            label_visibility="collapsed", key="cat_q",
+        ).strip()
+    with c2:
+        group_choice = st.selectbox("Type", list(group_labels), key="cat_group", label_visibility="collapsed")
+    with c3:
+        direction = st.selectbox(
+            "Direction", ["Any direction", "bullish", "bearish", "neutral"],
+            key="cat_dir", label_visibility="collapsed",
+        )
+    with c4:
+        sort = st.selectbox(
+            "Sort", ["Impact score", "Newest first", "Biggest move"],
+            key="cat_sort", label_visibility="collapsed",
+        )
+
+    f1, f2, f3 = st.columns([3, 2, 2])
+    with f1:
+        min_score = st.slider("Minimum impact score", 0, 90, 30, step=5, key="cat_min")
+    with f2:
+        window = st.selectbox("Window", ["24h", "48h", "6h", "7d"], key="cat_hours", label_visibility="collapsed")
+    with f3:
+        confirmed_only = st.checkbox("Price-confirmed only", key="cat_conf")
+        watch_only = st.checkbox("Watchlist only", key="cat_watch")
+
+    hours = {"6h": 6, "24h": 24, "48h": 48, "7d": 168}[window]
+    order = {"Impact score": "score", "Newest first": "time", "Biggest move": "move"}[sort]
+    watchlist = st.session_state.watchlist if watch_only else None
+
+    render_catalyst_kpis(catalyst_stats(fc, hours=hours))
+
+    catalysts = get_catalysts(
+        fc,
+        hours=hours,
+        min_score=min_score,
+        groups=[group_labels[group_choice]] if group_labels[group_choice] else None,
+        direction=None if direction == "Any direction" else direction,
+        search=query or None,
+        tickers=watchlist or None,
+        confirmed_only=confirmed_only,
+        order=order,
+        limit=120,
+    )
+
+    last_run = get_last_catalyst_run()
+    if last_run:
+        status = f"Scanned {_format_time(last_run, '%H:%M:%S')} {_tz_abbrev()} ({_relative_time(last_run)})"
+    else:
+        status = "Scanning feeds..."
+    st.markdown(
+        f'<div class="refresh-bar">'
+        f'<span><span class="refresh-dot"></span>{len(catalysts)} catalysts · score {min_score}+ · last {window}</span>'
+        f'<span>{status}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    render_catalysts(
+        catalysts,
+        empty_hint="Lower the minimum score, widen the window, or clear the filters above.",
+    )
     fc.close()
 
 
@@ -3103,7 +4167,9 @@ def frag_breaking():
 
 # ── Render layout
 with main_col:
-    tab1, tab2, tab6, tab3, tab5, tab7, tab4 = st.tabs(["📰 Live Feed", "📊 U/D Ratings", "💰 Earnings", "⚡ Catalysts", "🏷️ Symbols", "📋 All News", "📡 Feeds"])
+    tab0, tab1, tab2, tab6, tab3, tab5, tab7, tab4, tab8 = st.tabs(["🔊 Squawk", "📰 Live Feed", "📊 U/D Ratings", "💰 Earnings", "⚡ Catalyst Board", "🏷️ Symbols", "📋 All News", "📡 Feeds", "🤖 Discord"])
+    with tab0:
+        frag_squawk()
     with tab1:
         frag_live()
     with tab2:
@@ -3166,6 +4232,89 @@ with main_col:
                     st.rerun()
                 else:
                     st.error("Fill in both name and URL.")
+    with tab8:
+        st.markdown("### 🤖 Discord Integration")
+        st.caption(
+            "Push market news to Discord, routed by category. In Discord: "
+            "**Channel → Edit Channel → Integrations → Webhooks → New Webhook → Copy URL**, "
+            "then paste one URL per category below. New articles are delivered to each "
+            "channel as they arrive (last 30 min only, so you never get a backlog flood)."
+        )
+
+        dconn = get_connection()
+        routes = get_discord_routes(dconn)
+        dconn.close()
+        cats = [c.value for c in Category]
+        configured = sum(1 for c in cats if routes.get(c, {}).get("webhook_url"))
+        disabled_ct = sum(1 for c in cats if routes.get(c, {}).get("disabled"))
+
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            render_stat("Categories Routed", configured)
+        with s2:
+            render_stat("Total Categories", len(cats))
+        with s3:
+            render_stat("Auto-Disabled", disabled_ct)
+
+        if disabled_ct:
+            st.warning(
+                f"{disabled_ct} route(s) auto-disabled after repeated delivery failures "
+                "(deleted webhook?). Re-save the webhook URL to re-enable."
+            )
+
+        st.divider()
+        for cat in cats:
+            r = routes.get(cat, {})
+            url = r.get("webhook_url", "")
+            if r.get("disabled"):
+                badge = "🔴"
+            elif url and r.get("enabled"):
+                badge = "🟢"
+            elif url:
+                badge = "🟡"
+            else:
+                badge = "⚪"
+            with st.expander(f"{badge}  {cat}", expanded=False):
+                new_url = st.text_input(
+                    "Webhook URL",
+                    value=url,
+                    key=f"dc_url_{cat}",
+                    placeholder="https://discord.com/api/webhooks/...",
+                    type="password",
+                )
+                b1, b2, b3, b4 = st.columns([1, 1, 1, 2])
+                with b1:
+                    if st.button("Save", key=f"dc_save_{cat}"):
+                        if new_url.strip():
+                            cn = get_connection(); save_discord_route(cn, cat, new_url, True); cn.close()
+                            st.success("Saved"); st.rerun()
+                        else:
+                            st.error("Enter a webhook URL")
+                with b2:
+                    if st.button("Test", key=f"dc_test_{cat}"):
+                        target = new_url.strip() or url
+                        if target:
+                            ok, msg = discord_test_send(target, cat)
+                            (st.success if ok else st.error)(msg)
+                        else:
+                            st.error("Enter a webhook URL first")
+                with b3:
+                    if url and st.button("Remove", key=f"dc_del_{cat}"):
+                        cn = get_connection(); delete_discord_route(cn, cat); cn.close(); st.rerun()
+                with b4:
+                    if url:
+                        en = st.checkbox("Enabled", value=bool(r.get("enabled")), key=f"dc_en_{cat}")
+                        if en != bool(r.get("enabled")):
+                            cn = get_connection(); set_discord_route_enabled(cn, cat, en); cn.close(); st.rerun()
+                        if r.get("fail_count"):
+                            st.caption(f"⚠️ {r.get('fail_count')} recent delivery failure(s)")
+
+        st.divider()
+        st.caption(
+            "Tip: leave a category unset and its articles route to your **general** webhook "
+            "(if set). Delivery is performed by the backend service — it must be running "
+            "(`uvicorn backend.main:app`). Webhook URLs are stored locally and never committed."
+        )
 
 with breaking_col:
     frag_breaking()
