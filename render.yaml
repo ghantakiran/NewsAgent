@@ -1,23 +1,58 @@
+# Render blueprint — deploys both halves of NewsAgent.
+#
+#   newsagent-web  Streamlit dashboard (Squawk tape, Catalyst Board)
+#   newsagent-api  FastAPI REST API for the mobile app and integrations
+#
+# Deploy: Render Dashboard -> New -> Blueprint -> pick this repo.
+#
+# On storage: every router uses sync SQLite (backend/core/database.py), so a
+# Postgres URL would sit unused — this blueprint does not provision one. The
+# article cache is rebuilt from the feeds within seconds of boot, so losing it
+# on restart costs nothing. User accounts and watchlists do NOT survive a
+# restart on the free plan; see the `disk` block below to make them persist.
+
 services:
+  # ── Streamlit dashboard ────────────────────────────────────────────
+  - type: web
+    name: newsagent-web
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # Uncomment to let Grok read X and the web for breaking catalysts.
+      # - key: XAI_API_KEY
+      #   sync: false
+
+  # ── REST API ───────────────────────────────────────────────────────
   - type: web
     name: newsagent-api
     runtime: python
+    plan: free
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
       - key: JWT_SECRET
         generateValue: true
       - key: CORS_ORIGINS
         value: "*"
-      - key: DATABASE_URL
-        fromDatabase:
-          name: newsagent-db
-          property: connectionURI
-      - key: PYTHON_VERSION
-        value: "3.12"
+      # Discord webhooks and the Grok key are secrets — set them in the
+      # dashboard rather than committing them.
+      # - key: DISCORD_WEBHOOK_GENERAL
+      #   sync: false
+      # - key: XAI_API_KEY
+      #   sync: false
 
-databases:
-  - name: newsagent-db
-    plan: free
-    databaseName: newsagent
+    # Persistent storage for user accounts, watchlists and Discord routes.
+    # Render disks require a paid instance type, so this is left commented out:
+    # an uncommented disk on `plan: free` fails blueprint validation.
+    # disk:
+    #   name: newsagent-data
+    #   mountPath: /opt/render/project/src/data
+    #   sizeGB: 1

@@ -519,19 +519,50 @@ Catalyst behaviour is environment-driven (backend):
 
 ## Deployment
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full deployment guide.
+NewsAgent runs as two long-lived services:
 
-Quick deploy to Railway:
+| Service | Command | What it serves |
+|---------|---------|----------------|
+| `newsagent-web` | `streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true` | Squawk tape, Catalyst Board |
+| `newsagent-api` | `uvicorn backend.main:app --host 0.0.0.0 --port $PORT` | REST API, `/docs`, `/dashboard` |
+
+Both need a **persistent process**: the feed refresher runs on a background
+thread and Streamlit holds a WebSocket per client. That rules out serverless
+platforms (Vercel, Netlify Functions, Lambda) — use Render, Railway, Fly, or
+any container host.
+
+### Render (blueprint, both services)
+
+`render.yaml` defines both. Dashboard → **New** → **Blueprint** → pick this
+repo. Free-plan notes: services sleep after ~15 minutes idle and restart with
+an empty cache, which the feeds refill within seconds. User accounts and
+watchlists live in the same SQLite file, so uncomment the `disk` block (paid
+instance) to keep those across restarts.
+
+### Railway
+
+`railway.toml` configures the API. Create a second service from the same repo
+for the dashboard and override its start command — see the comments in that
+file. Attach a Volume at `/app/data` to persist accounts.
 
 ```bash
-# Install Railway CLI
 npm i -g @railway/cli
-
-# Deploy
-railway login
+railway login          # opens a browser
 railway init
 railway up
 ```
+
+### Docker
+
+The image needs the repository root as its build context, because the API
+imports the shared catalyst engine from `src/`:
+
+```bash
+docker build -f backend/Dockerfile -t newsagent-api .
+docker run -p 8000:8000 -v "$PWD/data:/app/data" newsagent-api
+```
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full guide.
 
 ## License
 

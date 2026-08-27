@@ -12,6 +12,8 @@ jobs:
   deploy:
     name: Deploy to Railway
     runs-on: ubuntu-latest
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -26,12 +28,22 @@ jobs:
           pip install pytest pytest-timeout
           pytest tests/ -v --timeout=120
 
+      # Skipped unless RAILWAY_TOKEN is configured, so a repo without deploy
+      # credentials gets a green build instead of a red one. The previous
+      # third-party action failed with "railway: not found" regardless of the
+      # token, so this shells out to the official CLI instead.
+      #
+      # The secret is tested through `env`, not `secrets`: GitHub does not
+      # expose the secrets context to a step-level `if`.
       - name: Deploy to Railway
-        if: success()
-        uses: bervProject/railway-deploy@main
-        with:
-          railway_token: ${{ secrets.RAILWAY_TOKEN }}
-          service: newsagent-api
+        if: ${{ success() && env.RAILWAY_TOKEN != '' }}
+        run: |
+          npm i -g @railway/cli
+          railway up --service newsagent-api --ci
+
+      - name: Deploy skipped
+        if: ${{ env.RAILWAY_TOKEN == '' }}
+        run: echo "RAILWAY_TOKEN not set - tests ran, deploy skipped."
         # Alternative for Render:
         # - name: Deploy to Render
         #   uses: johnbeynon/render-deploy-action@v0.0.8

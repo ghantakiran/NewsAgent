@@ -1,3 +1,17 @@
+# Railway config for the NewsAgent API service.
+#
+# railway.toml describes ONE service. NewsAgent has two, so create both in the
+# Railway dashboard from this same repo and override the start command on the
+# second:
+#
+#   newsagent-api  uses this file as-is
+#   newsagent-web  Settings -> Deploy -> Custom Start Command:
+#                  streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+#
+# Storage: every router uses sync SQLite (backend/core/database.py). The article
+# cache rebuilds from the feeds on boot, but user accounts and watchlists live in
+# that file, so attach a Volume mounted at /app/data to keep them across deploys.
+
 [build]
 builder = "nixpacks"
 
