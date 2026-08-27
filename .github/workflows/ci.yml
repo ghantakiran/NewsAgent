@@ -58,7 +58,9 @@ jobs:
   mobile-build:
     name: Mobile EAS Build
     needs: [backend-tests, mobile-typecheck]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Requires EXPO_TOKEN; without it eas-cli cannot authenticate, so the job
+    # would fail rather than usefully report anything.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.ENABLE_EAS_BUILD == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -69,7 +71,9 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # eas-cli's @oclif dependency requires Node >= 22; on 20 the install
+          # aborts with "The engine node is incompatible with this module".
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: mobile/package-lock.json
 
