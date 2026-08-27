@@ -5,10 +5,29 @@ dist/
 build/
 .env
 data/*.db
+# SQLite write-ahead sidecars — runtime state, never source
+data/*.db-shm
+data/*.db-wal
+# Downloaded SEC ticker universe (refreshes itself weekly)
+data/ticker_universe.json
 *.sqlite
 *.sqlite3
 .venv/
 venv/
+
+# Node / Mobile
+mobile/node_modules/
+mobile/dist/
+mobile/.expo/
+*.jsbundle
+
+# Environment
+.env.local
+
+# Build artifacts
+*.ipa
+*.apk
+*.aab
 
 # Dev artifacts
 .playwright-mcp/

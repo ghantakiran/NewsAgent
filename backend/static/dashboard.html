@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NewsAgent · Live Alerts</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #11161f; --panel2: #161c28; --border: #1f2735;
+    --text: #e6ebf2; --muted: #6b7394; --accent: #4f8cff; --flash: #2a3550;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text); font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .3px; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  .spacer { flex: 1; }
+  #filter {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 10px; border-radius: 8px; font-size: 13px; width: 180px; outline: none;
+  }
+  #filter:focus { border-color: var(--accent); }
+  .status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background .3s; }
+  .dot.live { background: #00d68f; box-shadow: 0 0 8px #00d68f88; }
+  .dot.down { background: #ff3b4e; }
+  main { max-width: 920px; margin: 0 auto; padding: 16px; }
+  #empty { color: var(--muted); text-align: center; padding: 60px 20px; font-size: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--cat, var(--muted));
+    border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; cursor: pointer;
+    transition: background .15s, transform .15s;
+  }
+  .card:hover { background: var(--panel2); }
+  .card.flash { animation: flash .9s ease-out; }
+  @keyframes flash {
+    0% { background: var(--flash); transform: scale(1.008); }
+    100% { background: var(--panel); transform: scale(1); }
+  }
+  .row1 { display: flex; align-items: center; gap: 10px; }
+  .ticker { font-weight: 700; font-size: 16px; letter-spacing: .5px; }
+  .cat {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600;
+    color: var(--cat, var(--muted)); padding: 2px 8px; border-radius: 999px;
+    background: color-mix(in srgb, var(--cat, var(--muted)) 14%, transparent);
+  }
+  .count {
+    font-size: 11px; font-weight: 700; color: #fff; background: var(--accent);
+    padding: 2px 7px; border-radius: 999px; min-width: 18px; text-align: center;
+  }
+  .count.hidden { display: none; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .time { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .row2 { margin-top: 6px; display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; }
+  .price { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .signal { color: var(--muted); }
+  .msg { margin-top: 6px; color: #c4ccda; font-size: 13px; }
+  .history { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; display: none; }
+  .card.open .history { display: block; }
+  .hrow { display: flex; gap: 10px; font-size: 12px; color: var(--muted); padding: 3px 0; font-variant-numeric: tabular-nums; }
+  .hrow .ht { width: 64px; flex: none; }
+  @media (max-width: 560px) { #filter { width: 110px; } header h1 span { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>NewsAgent <span>· Live Alerts</span></h1>
+  <div class="spacer"></div>
+  <input id="filter" placeholder="Filter tickers e.g. AAPL,NVDA" />
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting…</span></div>
+</header>
+<main>
+  <div id="empty">Waiting for alerts…</div>
+  <div id="feed"></div>
+</main>
+
+<script>
+// Category colors mirror backend CATEGORY_COLORS (schemas.py).
+const CAT_COLORS = {
+  general: "#6b7394", earnings: "#f5c542", upgrade: "#00d68f", downgrade: "#ff3b4e",
+  macro: "#0ea5e9", fda: "#a78bfa", "m&a": "#f97316", ipo: "#06b6d4", insider: "#fb923c",
+  dividend: "#4ade80", filing: "#94a3b8", crypto: "#f59e0b", tech: "#8b5cf6",
+  breakout: "#4f8cff",
+};
+
+const feed = document.getElementById("feed");
+const empty = document.getElementById("empty");
+const dot = document.getElementById("dot");
+const statusText = document.getElementById("statusText");
+const filterInput = document.getElementById("filter");
+
+const API_BASE = location.origin;
+const WS_BASE = (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
+let ws = null;
+let reconnectDelay = 1000;
+
+const MAX_CARDS = 200; // evict oldest DOM nodes to bound memory
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function catColor(c) { return CAT_COLORS[(c || "").toLowerCase()] || CAT_COLORS.general; }
+
+function fmtTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso), s = (Date.now() - d.getTime()) / 1000;
+  if (s < 60) return Math.max(0, Math.floor(s)) + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return d.toLocaleDateString();
+}
+function fmtClock(iso) {
+  if (!iso) return "";
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+function fmtPrice(p) { return (p === null || p === undefined || p === "") ? "" : "$" + Number(p).toLocaleString(undefined, { maximumFractionDigits: 4 }); }
+
+function cardHTML(g) {
+  const latest = g.latest || {};
+  const color = catColor(g.category);
+  const count = g.count > 1 ? `<span class="count">×${g.count}</span>` : `<span class="count hidden"></span>`;
+  const price = fmtPrice(latest.price);
+  const hist = (g.history || []).slice().reverse().map(h =>
+    `<div class="hrow"><span class="ht">${esc(fmtClock(h.received_at || g.last_seen))}</span>` +
+    `<span>${esc(fmtPrice(h.price) || "—")}</span><span>${esc(h.signal || "")}</span>` +
+    `<span style="color:#9aa3b5">${esc((h.message || "").slice(0, 80))}</span></div>`
+  ).join("");
+  return `
+    <div class="row1">
+      <span class="ticker">${esc(g.ticker || "—")}</span>
+      <span class="cat">${esc(g.category || "general")}</span>
+      ${count}
+      <span class="time" data-time="${esc(g.last_seen)}">${esc(fmtTime(g.last_seen))}</span>
+    </div>
+    <div class="row2">
+      ${price ? `<span class="price">${esc(price)}</span>` : ""}
+      ${g.signal ? `<span class="signal">${esc(g.signal)}</span>` : ""}
+      ${g.timeframe ? `<span class="signal">${esc(g.timeframe)}</span>` : ""}
+    </div>
+    ${latest.message ? `<div class="msg">${esc(latest.message)}</div>` : ""}
+    <div class="history">${hist}</div>`;
+}
+
+function upsertCard(g, flash) {
+  empty.style.display = "none";
+  let el = document.getElementById("g-" + g.group_id);
+  const wasOpen = el && el.classList.contains("open");
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "card";
+    el.id = "g-" + g.group_id;
+    el.addEventListener("click", () => el.classList.toggle("open"));
+  }
+  el.style.setProperty("--cat", catColor(g.category));
+  el.innerHTML = cardHTML(g);
+  if (wasOpen) el.classList.add("open");
+  feed.prepend(el); // newest activity on top
+  if (flash) { el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash"); }
+  while (feed.childElementCount > MAX_CARDS) feed.lastElementChild.remove();
+}
+
+function setStatus(state) {
+  dot.className = "dot" + (state === "live" ? " live" : state === "down" ? " down" : "");
+  statusText.textContent = state === "live" ? "live" : state === "down" ? "disconnected" : "connecting…";
+}
+
+async function backfill() {
+  try {
+    const r = await fetch(API_BASE + "/api/v1/alerts?hours=24&limit=200");
+    const j = await r.json();
+    // oldest first so prepend leaves newest on top
+    j.groups.slice().reverse().forEach(g => upsertCard(g, false));
+  } catch (e) { /* stream will populate */ }
+}
+
+function tickerQS() {
+  const v = filterInput.value.trim().toUpperCase().replace(/\s+/g, "");
+  return v ? "?tickers=" + encodeURIComponent(v) : "";
+}
+
+function connect() {
+  setStatus("connecting");
+  ws = new WebSocket(WS_BASE + "/api/v1/ws/live" + tickerQS());
+  ws.onopen = () => { setStatus("live"); reconnectDelay = 1000; };
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.type === "alert") upsertCard(m.data, m.event === "update" || m.data.count > 1);
+  };
+  ws.onclose = () => { setStatus("down"); setTimeout(connect, reconnectDelay); reconnectDelay = Math.min(reconnectDelay * 1.6, 15000); };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+}
+
+// Refresh relative timestamps every 15s
+setInterval(() => {
+  document.querySelectorAll(".time[data-time]").forEach(el => { el.textContent = fmtTime(el.dataset.time); });
+}, 15000);
+
+// Re-subscribe on filter change (reconnect with new ticker query)
+let filterTimer = null;
+filterInput.addEventListener("input", () => {
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(() => { if (ws) { ws.onclose = null; ws.close(); } connect(); }, 400);
+});
+
+backfill().then(connect);
+</script>
+</body>
+</html>
