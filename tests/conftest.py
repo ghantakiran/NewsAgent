@@ -9,10 +9,28 @@ from fastapi.testclient import TestClient
 
 from backend.main import app
 from backend.core.database import get_connection, init_db
+from backend.services.catalyst_service import init_catalyst_tables
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _schema():
+    """Create the schema the API expects before any request is made.
+
+    TestClient is used without entering its lifespan, so the startup hook that
+    normally calls init_db never runs. Locally this passed only because a
+    developer database already existed on disk; on a clean checkout every
+    endpoint failed with "no such table".
+    """
+    conn = get_connection()
+    try:
+        init_db(conn)
+        init_catalyst_tables(conn)
+    finally:
+        conn.close()
 
 
 @pytest.fixture
-def client():
+def client(_schema):
     """FastAPI test client."""
     return TestClient(app)
 

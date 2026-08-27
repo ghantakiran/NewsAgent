@@ -137,7 +137,9 @@ class GrokClient:
         self.model = model
         self.timeout = timeout
         self.min_interval = min_interval
-        self._last_call = 0.0
+        # -inf, not 0: on a freshly booted machine time.monotonic() is itself
+        # near zero, which would make a brand-new client look rate-limited.
+        self._last_call = float("-inf")
 
     def available(self) -> bool:
         return available()
