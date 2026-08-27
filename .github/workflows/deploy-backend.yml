@@ -1,0 +1,40 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'config/**'
+      - 'requirements.txt'
+
+jobs:
+  deploy:
+    name: Deploy to Railway
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install and test
+        run: |
+          pip install -r backend/requirements.txt
+          pip install pytest pytest-timeout
+          pytest tests/ -v --timeout=120
+
+      - name: Deploy to Railway
+        if: success()
+        uses: bervProject/railway-deploy@main
+        with:
+          railway_token: ${{ secrets.RAILWAY_TOKEN }}
+          service: newsagent-api
+        # Alternative for Render:
+        # - name: Deploy to Render
+        #   uses: johnbeynon/render-deploy-action@v0.0.8
+        #   with:
+        #     service-id: ${{ secrets.RENDER_SERVICE_ID }}
+        #     api-key: ${{ secrets.RENDER_API_KEY }}
